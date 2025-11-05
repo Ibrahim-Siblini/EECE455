@@ -1,0 +1,14 @@
+numpy
+pandas
+tqdm
+matplotlib
+seaborn
+python-Levenshtein
+
+torch
+transformers
+accelerate
+sentencepiece
+tokenizers
+
+llama-cpp-python
