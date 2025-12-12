@@ -1,17 +1,3 @@
-# crypto_llama_demo.py
-"""
-Crypto Analysis Demo with CodeLlama classification (safe educational version)
-
-- Classical ciphers: Caesar, Affine, Vigenere (encrypt/decrypt + classical attacks)
-- AES sample generation (ECB, CBC, CTR) with safe simulated vulnerabilities
-- Heuristic detectors for ECB repetition, all-zero IV, padding-like pattern
-- CodeLlama integration (local gguf via llama_cpp) to classify mode & vulnerabilities (classification-only)
-- Toy brute-force demo (ONLY repeated-byte 256-keyspace) for educational purposes.
-- Outputs CSV and plots in ./outputs
-
-Author: Massu (adapted)
-Date: 2025-12-12
-"""
 import os
 import time
 import random
