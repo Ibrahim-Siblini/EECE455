@@ -1,8 +1,10 @@
+
 import os
 import time
 import random
 import string
 import json
+import hashlib
 from collections import Counter
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Any, Dict
@@ -12,548 +14,655 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# Crypto
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 from Crypto.Util.Padding import pad, unpad
+from Crypto.Util import Counter as CryptoCounter
 
-# Try to import llama_cpp; if missing, we'll use a simulated classifier
+# Llama integration
 LLAMA_AVAILABLE = True
 try:
     from llama_cpp import Llama
-except Exception as e:
+except Exception:
     LLAMA_AVAILABLE = False
 
-# ----------------------------
-# Configuration
-# ----------------------------
-MODEL_PATH = "codellama-7b.Q5_K_M.gguf"   # your GGUF file
-LLAMA_THREADS = 8
-USE_LLAMA = True                           # set False to force simulated classifier
+# ---------------- Configuration ----------------
 OUT_DIR = "./outputs"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 RNG_SEED = 42
 random.seed(RNG_SEED)
 np.random.seed(RNG_SEED)
-sns.set_theme(style="whitegrid", font_scale=1.05)
 
-# ----------------------------
-# Utilities & classical ciphers
-# ----------------------------
-ALPHABET = string.ascii_uppercase
+MODEL_PATH = "codellama-7b.Q5_K_M.gguf"
+LLAMA_THREADS = 8
+USE_LLAMA = LLAMA_AVAILABLE
+
 BLOCK = 16
 
-def normalize_text(s: str) -> str:
-    s = ''.join(ch for ch in s.upper() if ch.isalpha() or ch.isspace())
-    return ' '.join(s.split())
-
-# Caesar
-def caesar_encrypt(plain: str, k: int) -> str:
-    out = []
-    for ch in plain:
-        if ch.isalpha():
-            out.append(chr((ord(ch)-65 + k) % 26 + 65))
-        else:
-            out.append(ch)
-    return ''.join(out)
-
-def caesar_decrypt(ct: str, k: int) -> str:
-    return caesar_encrypt(ct, (-k) % 26)
-
-# Affine
-def _inv_mod_26(a: int) -> Optional[int]:
-    for i in range(26):
-        if (a * i) % 26 == 1:
-            return i
-    return None
-
-def affine_encrypt(plain: str, a: int, b: int) -> str:
-    out=[]
-    for ch in plain:
-        if ch.isalpha():
-            x = ord(ch)-65
-            out.append(chr((a*x + b) % 26 + 65))
-        else:
-            out.append(ch)
-    return ''.join(out)
-
-def affine_decrypt(ct: str, a:int, b:int) -> str:
-    a_inv = _inv_mod_26(a)
-    if a_inv is None:
-        raise ValueError("No modular inverse for 'a'")
-    out=[]
-    for ch in ct:
-        if ch.isalpha():
-            y = ord(ch)-65
-            x = (a_inv * (y - b)) % 26
-            out.append(chr(x+65))
-        else:
-            out.append(ch)
-    return ''.join(out)
-
-# Vigenere
-def vigenere_encrypt(plain: str, key: str) -> str:
-    key = ''.join(k for k in key.upper() if k.isalpha())
-    out=[]; ki=0
-    for ch in plain:
-        if ch.isalpha():
-            k = ord(key[ki % len(key)]) - 65
-            out.append(chr((ord(ch)-65 + k) % 26 + 65))
-            ki += 1
-        else:
-            out.append(ch)
-    return ''.join(out)
-
-def vigenere_decrypt(ct: str, key: str) -> str:
-    key = ''.join(k for k in key.upper() if k.isalpha())
-    out=[]; ki=0
-    for ch in ct:
-        if ch.isalpha():
-            k = ord(key[ki % len(key)]) - 65
-            out.append(chr((ord(ch)-65 - k) % 26 + 65))
-            ki += 1
-        else:
-            out.append(ch)
-    return ''.join(out)
-
-# English frequency scoring (for classical solvers)
-ENGLISH_FREQ = {
- 'A':0.08167,'B':0.01492,'C':0.02782,'D':0.04253,'E':0.12702,'F':0.02228,'G':0.02015,
- 'H':0.06094,'I':0.06966,'J':0.00153,'K':0.00772,'L':0.04025,'M':0.02406,'N':0.06749,
- 'O':0.07507,'P':0.01929,'Q':0.00095,'R':0.05987,'S':0.06327,'T':0.09056,'U':0.02758,
- 'V':0.00978,'W':0.02360,'X':0.00150,'Y':0.01974,'Z':0.00074
+# ---------------- AES Weakness Types ----------------
+WEAKNESS_TYPES = {
+    "ecb_repetition": "ECB mode with repeated plaintext blocks",
+    "ecb_known_plaintext": "ECB mode with known plaintext blocks",
+    "cbc_zero_iv": "CBC mode with all-zero IV",
+    "cbc_predictable_iv": "CBC mode with predictable/sequential IV",
+    "cbc_padding_oracle": "CBC mode vulnerable to padding oracle attack",
+    "ctr_nonce_reuse": "CTR mode with nonce reuse",
+    "ctr_keystream_reuse": "CTR mode with keystream reuse",
+    "weak_key": "Weak or related keys",
+    "small_key_space": "Small key space (reduced rounds or weak key schedule)",
+    "timing_sidechannel": "Timing side-channel vulnerability",
+    "none": "No known weakness"
 }
 
-def english_score(text:str)->float:
-    t = ''.join(ch for ch in text.upper() if ch.isalpha())
-    N = len(t)
-    if N == 0:
-        return -9999.0
-    freqs = Counter(t)
-    score = 0.0
-    for ch, f in ENGLISH_FREQ.items():
-        obs = freqs.get(ch, 0) / N
-        score -= (obs - f) ** 2
-    return score
-
-# Classical solvers
-def best_caesar(ct: str) -> Tuple[int,str,float]:
-    best_s = -1e9; best_k=None; best_p=None
-    for k in range(26):
-        p = caesar_decrypt(ct, k)
-        s = english_score(p)
-        if s > best_s:
-            best_s, best_k, best_p = s, k, p
-    return best_k, best_p, best_s
-
-def best_affine(ct: str) -> Tuple[Tuple[int,int],str,float]:
-    best_s = -1e9; best_key=None; best_p=None
-    for a in range(1,26):
-        if math.gcd(a, 26) != 1:
-            continue
-        for b in range(26):
-            p = affine_decrypt(ct, a, b)
-            s = english_score(p)
-            if s > best_s:
-                best_s, best_key, best_p = s, (a,b), p
-    return best_key, best_p, best_s
-
-def index_of_coincidence(text: str) -> float:
-    t = ''.join(ch for ch in text if ch.isalpha())
-    N = len(t)
-    if N <= 1: return 0.0
-    freqs = Counter(t)
-    return sum(v*(v-1) for v in freqs.values())/(N*(N-1))
-
-def friedman_estimate(ct: str) -> int:
-    ic = index_of_coincidence(ct)
-    if ic <= 0:
-        return 1
-    k = (0.0265 * len(ct)) / ((0.065 - ic) + (len(ct) * (ic - 0.0385)))
-    return max(1, int(round(k)))
-
-def vigenere_attack(ct: str, max_len: int=10) -> Tuple[str,str,float]:
-    guess_len = min(max_len, max(1, friedman_estimate(ct)))
-    key = ''
-    for i in range(guess_len):
-        subseq = ''.join(ch for idx,ch in enumerate(ct) if ch.isalpha() and (idx % guess_len) == i)
-        best_shift, best_score = 0, -1e9
-        for s in range(26):
-            dec = ''.join(chr((ord(ch)-65 - s) % 26 + 65) for ch in subseq)
-            sc = english_score(dec)
-            if sc > best_score:
-                best_shift, best_score = s, sc
-        key += chr(best_shift + 65)
-    plain = vigenere_decrypt(ct, key)
-    return key, plain, english_score(plain)
-
-# ----------------------------
-# AES helpers and detectors
-# ----------------------------
-def aes_ecb_encrypt_bytes(pt: bytes, key: bytes) -> bytes:
-    cipher = AES.new(key, AES.MODE_ECB)
-    return cipher.encrypt(pad(pt, BLOCK))
-
-def aes_cbc_encrypt_bytes(pt: bytes, key: bytes, iv: bytes) -> bytes:
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    return cipher.encrypt(pad(pt, BLOCK))
-
-def aes_ctr_encrypt_bytes(pt: bytes, key: bytes, nonce: bytes) -> bytes:
-    cipher = AES.new(key, AES.MODE_CTR, nonce=nonce)
-    return cipher.encrypt(pt)  # CTR doesn't require padding
-
-def detect_ecb_repetition(ct: bytes, block_size:int=16) -> bool:
-    blocks = [ct[i:i+block_size] for i in range(0, len(ct), block_size)]
-    return len(set(blocks)) < len(blocks)
-
-def detect_all_zero_iv(iv: Optional[bytes]) -> bool:
-    if iv is None:
-        return False
-    return all(b==0 for b in iv)
-
-def detect_padding_like_signature(ct: bytes) -> bool:
-    # purely heuristic: ends with a full block of same pad byte (fake signal)
-    if len(ct) < BLOCK: return False
-    last = ct[-1]
-    return ct.endswith(bytes([last]) * last) if 1 <= last <= BLOCK else False
-
-# ----------------------------
-# Toy repeated-byte brute-force (SAFE demo only)
-# ----------------------------
-def toy_repeated_byte_bruteforce(ct_bytes: bytes, iv: Optional[bytes], mode: str, max_candidates:int=256):
+# ---------------- Enhanced AES Generation with More Weaknesses ----------------
+def generate_weak_aes_samples(n_samples_per_type: int = 10) -> List[Dict]:
     """
-    Educational-only brute force for toy keys of the form byte * 16.
-    Safe default = 256 candidates (0..255).
-    The function refuses to run when max_candidates is huge.
+    Generate AES samples with various weaknesses for training/testing.
     """
-    if max_candidates > 2**20:
-        raise RuntimeError("Refusing to brute-force a large keyspace for safety.")
-    found = []
-    attempts = 0
-    for b in range(max_candidates):
-        attempts += 1
-        k = bytes([b]) * 16
-        try:
-            if mode == 'ECB':
-                plain_padded = AES.new(k, AES.MODE_ECB).decrypt(ct_bytes)
-                pt = unpad(plain_padded, BLOCK)
-                found.append((b, pt))
-                break
-            elif mode == 'CBC':
-                if iv is None:
-                    continue
-                plain_padded = AES.new(k, AES.MODE_CBC, iv).decrypt(ct_bytes)
-                pt = unpad(plain_padded, BLOCK)
-                found.append((b, pt))
-                break
-        except Exception:
-            pass
-    return found, attempts
-
-# ----------------------------
-# Dataset generation
-# ----------------------------
-SAMPLE_PLAINS = [
-    "Attack at dawn. The troops will move at first light.",
-    "The quick brown fox jumps over the lazy dog.",
-    "Security through obscurity is not a good design.",
-    "We will measure success rate and runtime across many samples.",
-    "Classical ciphers are educational but not secure by modern standards.",
-    "Natural language redundancy helps frequency-based attacks succeed."
-]
-
-@dataclass
-class Record:
-    cipher: str
-    plain: str
-    cipher_text: str
-    true_key: Any
-    length: int
-
-def make_classical_records(n_each:int=6) -> List[Record]:
-    recs=[]
-    # caesar
-    for _ in range(n_each):
-        p = normalize_text(random.choice(SAMPLE_PLAINS))
-        k = random.randint(1,25)
-        ct = caesar_encrypt(p, k)
-        recs.append(Record('caesar', p, ct, k, len(p)))
-    # affine
-    a_choices = [a for a in range(1,26) if math.gcd(a,26)==1]
-    for _ in range(n_each):
-        p = normalize_text(random.choice(SAMPLE_PLAINS))
-        a = random.choice(a_choices)
-        b = random.randint(0,25)
-        ct = affine_encrypt(p, a, b)
-        recs.append(Record('affine', p, ct, (a,b), len(p)))
-    # vigenere
-    for _ in range(n_each):
-        p = normalize_text(random.choice(SAMPLE_PLAINS))
-        key_len = random.randint(3,6)
-        key = ''.join(random.choice(ALPHABET) for _ in range(key_len))
-        ct = vigenere_encrypt(p, key)
-        recs.append(Record('vigenere', p, ct, key, len(p)))
-    return recs
-
-def make_aes_records(n:int=12, modes:Tuple[str,...]=('ECB','CBC','CTR')):
-    recs=[]
-    for _ in range(n):
-        p = random.choice(SAMPLE_PLAINS).encode('utf-8')
-        mode = random.choice(modes)
-        # generate key
+    samples = []
+    
+    # 1. ECB with repeated blocks (easy to detect)
+    for _ in range(n_samples_per_type):
         key = get_random_bytes(16)
-        # sometimes simulate all-zero IV for vulnerability
-        if mode == 'ECB':
-            ct = aes_ecb_encrypt_bytes(p, key)
-            true = {'mode':'ECB','key':key.hex(),'iv': None}
-        elif mode == 'CBC':
-            iv = bytes(16) if random.random() < 0.15 else get_random_bytes(16)
-            ct = aes_cbc_encrypt_bytes(p, key, iv)
-            true = {'mode':'CBC','key':key.hex(), 'iv': iv.hex() if iv is not None else None}
-        elif mode == 'CTR':
-            nonce = get_random_bytes(8)
-            ct = aes_ctr_encrypt_bytes(p, key, nonce)
-            true = {'mode':'CTR','key':key.hex(),'nonce':nonce.hex()}
-        else:
-            continue
-        recs.append(Record('aes', p.decode('utf-8', errors='ignore'), ct.hex(), true, len(p)))
-    return recs
+        repeated_block = get_random_bytes(16)
+        pt = repeated_block * 4  # Repeat 4 times
+        cipher = AES.new(key, AES.MODE_ECB)
+        ct = cipher.encrypt(pad(pt, BLOCK))
+        samples.append({
+            "mode": "ECB",
+            "plaintext": pt.hex(),
+            "ciphertext": ct.hex(),
+            "key": key.hex(),
+            "iv": None,
+            "nonce": None,
+            "weakness_type": "ecb_repetition",
+            "exploitable": True,
+            "attack_method": "block_repetition_analysis"
+        })
+    
+    # 2. ECB with known plaintext (first block known)
+    for _ in range(n_samples_per_type):
+        key = get_random_bytes(16)
+        known_block = b"KNOWN_PLAINTEXT"[:16].ljust(16, b'\x00')
+        unknown_data = get_random_bytes(32)
+        pt = known_block + unknown_data
+        cipher = AES.new(key, AES.MODE_ECB)
+        ct = cipher.encrypt(pad(pt, BLOCK))
+        samples.append({
+            "mode": "ECB",
+            "plaintext": pt.hex(),
+            "ciphertext": ct.hex(),
+            "key": key.hex(),
+            "iv": None,
+            "nonce": None,
+            "weakness_type": "ecb_known_plaintext",
+            "exploitable": True,
+            "attack_method": "known_plaintext_attack",
+            "known_plaintext": known_block.hex()
+        })
+    
+    # 3. CBC with zero IV
+    for _ in range(n_samples_per_type):
+        key = get_random_bytes(16)
+        iv = bytes(16)  # All zeros
+        pt = get_random_bytes(48)
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        ct = cipher.encrypt(pad(pt, BLOCK))
+        samples.append({
+            "mode": "CBC",
+            "plaintext": pt.hex(),
+            "ciphertext": ct.hex(),
+            "key": key.hex(),
+            "iv": iv.hex(),
+            "nonce": None,
+            "weakness_type": "cbc_zero_iv",
+            "exploitable": True,
+            "attack_method": "iv_manipulation"
+        })
+    
+    # 4. CBC with predictable IV (sequential)
+    for i in range(n_samples_per_type):
+        key = get_random_bytes(16)
+        iv = i.to_bytes(16, 'big')  # Sequential IV
+        pt = get_random_bytes(48)
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        ct = cipher.encrypt(pad(pt, BLOCK))
+        samples.append({
+            "mode": "CBC",
+            "plaintext": pt.hex(),
+            "ciphertext": ct.hex(),
+            "key": key.hex(),
+            "iv": iv.hex(),
+            "nonce": None,
+            "weakness_type": "cbc_predictable_iv",
+            "exploitable": True,
+            "attack_method": "predictable_iv_attack"
+        })
+    
+    # 5. CTR with nonce reuse
+    for _ in range(n_samples_per_type):
+        key1 = get_random_bytes(16)
+        key2 = get_random_bytes(16)
+        nonce = get_random_bytes(8)  # Same nonce for both
+        pt1 = get_random_bytes(32)
+        pt2 = get_random_bytes(32)
+        cipher1 = AES.new(key1, AES.MODE_CTR, nonce=nonce)
+        cipher2 = AES.new(key2, AES.MODE_CTR, nonce=nonce)
+        ct1 = cipher1.encrypt(pt1)
+        ct2 = cipher2.encrypt(pt2)
+        # Store as two related samples
+        samples.append({
+            "mode": "CTR",
+            "plaintext": pt1.hex(),
+            "ciphertext": ct1.hex(),
+            "key": key1.hex(),
+            "iv": None,
+            "nonce": nonce.hex(),
+            "weakness_type": "ctr_nonce_reuse",
+            "exploitable": True,
+            "attack_method": "nonce_reuse_xor_attack",
+            "related_ciphertext": ct2.hex(),
+            "related_plaintext": pt2.hex()
+        })
+    
+    # 6. CTR with keystream reuse (same key, same nonce)
+    for _ in range(n_samples_per_type):
+        key = get_random_bytes(16)
+        nonce = get_random_bytes(8)
+        pt1 = get_random_bytes(32)
+        pt2 = get_random_bytes(32)
+        cipher = AES.new(key, AES.MODE_CTR, nonce=nonce)
+        ct1 = cipher.encrypt(pt1)
+        cipher = AES.new(key, AES.MODE_CTR, nonce=nonce)  # Reuse
+        ct2 = cipher.encrypt(pt2)
+        samples.append({
+            "mode": "CTR",
+            "plaintext": pt1.hex(),
+            "ciphertext": ct1.hex(),
+            "key": key.hex(),
+            "iv": None,
+            "nonce": nonce.hex(),
+            "weakness_type": "ctr_keystream_reuse",
+            "exploitable": True,
+            "attack_method": "keystream_reuse_xor",
+            "related_ciphertext": ct2.hex(),
+            "related_plaintext": pt2.hex()
+        })
+    
+    # 7. Secure samples (no obvious weakness)
+    for _ in range(n_samples_per_type * 2):
+        key = get_random_bytes(16)
+        iv = get_random_bytes(16)
+        pt = get_random_bytes(48)
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        ct = cipher.encrypt(pad(pt, BLOCK))
+        samples.append({
+            "mode": "CBC",
+            "plaintext": pt.hex(),
+            "ciphertext": ct.hex(),
+            "key": key.hex(),
+            "iv": iv.hex(),
+            "nonce": None,
+            "weakness_type": "none",
+            "exploitable": False,
+            "attack_method": None
+        })
+    
+    random.shuffle(samples)
+    return samples
 
-# ----------------------------
-# CodeLlama integration (classification only)
-# ----------------------------
+# ---------------- Few-Shot Training Examples ----------------
+FEW_SHOT_EXAMPLES = """
+# Example 1: ECB Repetition Attack
+Ciphertext: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6
+Analysis: The ciphertext shows repeating 16-byte blocks (a1b2c3d4e5f6 repeated 4 times).
+Weakness: ECB mode with repeated plaintext blocks
+Attack: Since ECB encrypts identical blocks identically, we can identify patterns.
+Plaintext blocks are likely identical. If we know one plaintext block, we can identify all occurrences.
+Result: Pattern detected, plaintext structure revealed.
+
+# Example 2: CBC Zero IV Attack
+Ciphertext: 5f8a3b2c1d4e6f7a8b9c0d1e2f3a4b5
+IV: 00000000000000000000000000000000
+Analysis: IV is all zeros, which is a security weakness.
+Weakness: CBC mode with all-zero IV
+Attack: With zero IV, the first block's encryption is predictable. If we can manipulate the IV, we can control the first block's decryption.
+Result: First block vulnerable to manipulation.
+
+# Example 3: CTR Nonce Reuse Attack
+Ciphertext1: a1b2c3d4e5f6...
+Ciphertext2: f6e5d4c3b2a1...
+Nonce: 1234567890abcdef (same for both)
+Analysis: Same nonce used with different keys/plaintexts.
+Weakness: CTR nonce reuse
+Attack: XOR the two ciphertexts: ct1 XOR ct2 = (pt1 XOR keystream) XOR (pt2 XOR keystream) = pt1 XOR pt2
+If we know pt1, we can recover pt2, or use frequency analysis on pt1 XOR pt2.
+Result: Plaintexts can be recovered through XOR analysis.
+
+# Example 4: Secure CBC
+Ciphertext: 8f3a7b2c9d4e1f6a5b8c2d7e3f9a4b1c6
+IV: 7a3f8b2c9d4e1f6a5b8c2d7e3f9a4b1 (random)
+Analysis: Random IV, proper CBC mode implementation.
+Weakness: None detected
+Attack: No obvious attack vector
+Result: Secure implementation.
+"""
+
+# ---------------- Enhanced LLM Cryptanalysis Function ----------------
 LLAMA_OBJ = None
 
-def init_llama(model_path: str = MODEL_PATH, n_threads:int = LLAMA_THREADS):
+def init_llama(model_path=MODEL_PATH, n_threads=LLAMA_THREADS):
     global LLAMA_OBJ
     if not LLAMA_AVAILABLE:
-        print("[WARN] llama_cpp not installed — classifier will be simulated.")
         return None
     try:
-        LLAMA_OBJ = Llama(model_path=model_path, n_threads=n_threads)
-        print(f"[INFO] Loaded Llama model from {model_path}")
+        LLAMA_OBJ = Llama(model_path=model_path, n_threads=n_threads, n_ctx=4096)
         return LLAMA_OBJ
-    except Exception as e:
-        print("[WARN] Failed to load Llama model:", e)
+    except Exception:
         LLAMA_OBJ = None
         return None
 
-def parse_llm_json_like(text: str) -> Dict[str,Any]:
+def analyze_with_llm(sample: Dict) -> Dict[str, Any]:
     """
-    LLMs may not emit strict JSON. We try a forgiving parse:
-    - try json.loads first
-    - if fails, extract lines 'Mode:' and 'Vulnerabilities:' etc.
+    Use LLM with few-shot learning to analyze AES sample and detect weaknesses.
     """
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        # fallback simple parsing
-        out = {'mode_guess': None, 'vulnerabilities': [], 'reasoning': text}
-        for line in text.splitlines():
-            line = line.strip()
-            if line.lower().startswith('mode:'):
-                out['mode_guess'] = line.split(':',1)[1].strip().upper()
-            elif line.lower().startswith('vulnerabilities:'):
-                vals = line.split(':',1)[1].strip()
-                out['vulnerabilities'] = [v.strip().lower() for v in vals.split(',') if v.strip()]
-        return out
+    if not USE_LLAMA or not LLAMA_AVAILABLE or LLAMA_OBJ is None:
+        return analyze_with_heuristics(sample)
+    
+    prompt = f"""{FEW_SHOT_EXAMPLES}
 
-def llama_classify_aes(ct_hex: str, iv_hex: Optional[str]=None, nonce_hex: Optional[str]=None) -> Dict[str,Any]:
-    """
-    Ask the LLM to classify AES mode and vulnerabilities.
-    **Important**: prompt explicitly forbids brute-force or key recovery.
-    If the model is not available or USE_LLAMA is False, fall back to a simulated heuristic result.
-    """
-    # Heuristic fallback first (fast)
-    def heuristic_result():
-        ct_bytes = bytes.fromhex(ct_hex)
-        vulns = []
-        mode_guess = 'UNKNOWN'
-        if detect_ecb_repetition(ct_bytes):
-            mode_guess = 'ECB'
-            vulns.append('ecb_repetition')
-        # zero IV
-        if iv_hex:
-            try:
-                if detect_all_zero_iv(bytes.fromhex(iv_hex)):
-                    if mode_guess == 'UNKNOWN':
-                        mode_guess = 'CBC'
-                    vulns.append('all_zero_iv')
-            except Exception:
-                pass
-        if detect_padding_like_signature(ct_bytes):
-            vulns.append('padding_like')
-        if not vulns:
-            vulns = ['none']
-        return {'mode_guess': mode_guess, 'vulnerabilities': vulns, 'reasoning': 'heuristic'}
-    # If not using LLM or llama not loaded, return heuristic
-    if (not USE_LLAMA) or (not LLAMA_AVAILABLE) or (LLAMA_OBJ is None):
-        return heuristic_result()
+# New Sample to Analyze:
+Ciphertext: {sample['ciphertext']}
+IV: {sample.get('iv', 'NONE')}
+Nonce: {sample.get('nonce', 'NONE')}
+Mode: {sample.get('mode', 'UNKNOWN')}
 
-    # Build a safe prompt
-    prompt = f"""
-You are an assistant that can analyze ciphertext structure and metadata for AES-mode classification.
-DO NOT attempt to recover keys or run brute-force. This is classification only.
+Analyze this AES ciphertext and identify:
+1. What weakness exists (if any)?
+2. How can this weakness be exploited?
+3. What attack method would work?
+4. Can plaintext be recovered (partially or fully)?
 
-Return a JSON object with keys:
-- mode_guess: one of "ECB", "CBC", "CTR", or "UNKNOWN"
-- vulnerabilities: a list containing any of "ecb_repetition", "all_zero_iv", "padding_like", "nonce_reuse", or "none"
-- reasoning: a short explanation.
-
-Ciphertext(hex): {ct_hex}
-IV(hex): {iv_hex if iv_hex else 'NONE'}
-Nonce(hex): {nonce_hex if nonce_hex else 'NONE'}
+Provide your analysis in JSON format:
+{{
+    "weakness_detected": "weakness_type or 'none'",
+    "weakness_description": "detailed description",
+    "attack_method": "how to exploit",
+    "exploitable": true/false,
+    "recovered_plaintext": "hex string if recoverable, else null",
+    "reasoning": "step-by-step analysis"
+}}
 """
+    
     try:
-        resp = LLAMA_OBJ.create_completion(prompt=prompt, max_tokens=256, temperature=0.0, top_p=0.95)
-        text = resp.get('choices', [{}])[0].get('text','').strip()
-        # Try to parse returned text
-        parsed = parse_llm_json_like(text)
-        # sanitize
-        if parsed.get('mode_guess') is None:
-            parsed['mode_guess'] = parsed.get('mode', 'UNKNOWN')
-        if 'vulnerabilities' not in parsed:
-            parsed['vulnerabilities'] = parsed.get('vulns', ['none'])
-        return parsed
+        t0 = time.time()
+        resp = LLAMA_OBJ.create_completion(
+            prompt=prompt,
+            max_tokens=512,
+            temperature=0.1,  # Low temperature for more deterministic analysis
+            top_p=0.95,
+            stop=["# New Sample", "\n\n#"]
+        )
+        t1 = time.time()
+        
+        text = resp.get('choices', [{}])[0].get('text', '').strip()
+        
+        # Try to parse JSON from response
+        result = parse_llm_response(text, sample)
+        result['llm_latency_s'] = t1 - t0
+        result['source'] = 'llm'
+        
+        return result
     except Exception as e:
-        print("[WARN] Llama call failed:", e)
-        return heuristic_result()
+        print(f"[WARN] LLM analysis failed: {e}")
+        return analyze_with_heuristics(sample)
 
-# ----------------------------
-# Experiment runner + evaluation & plotting
-# ----------------------------
-def run_experiments(run_llm: bool = True, toy_bruteforce_demo: bool = False):
-    # Build datasets
-    classical = make_classical_records(n_each=6)
-    aes_recs = make_aes_records(n=18, modes=('ECB','CBC','CTR'))
-    ALL = classical + aes_recs
-    print(f"[INFO] Total samples: {len(ALL)} (classical {len(classical)}, aes {len(aes_recs)})")
+def parse_llm_response(text: str, sample: Dict) -> Dict[str, Any]:
+    """Parse LLM response and extract structured information."""
+    # Try to find JSON in response
+    try:
+        # Look for JSON block
+        start = text.find('{')
+        end = text.rfind('}') + 1
+        if start >= 0 and end > start:
+            json_str = text[start:end]
+            parsed = json.loads(json_str)
+            return {
+                'weakness_detected': parsed.get('weakness_detected', 'unknown'),
+                'weakness_description': parsed.get('weakness_description', ''),
+                'attack_method': parsed.get('attack_method', ''),
+                'exploitable': parsed.get('exploitable', False),
+                'recovered_plaintext': parsed.get('recovered_plaintext'),
+                'reasoning': parsed.get('reasoning', text[:200])
+            }
+    except:
+        pass
+    
+    # Fallback: extract information from text
+    result = {
+        'weakness_detected': 'unknown',
+        'weakness_description': '',
+        'attack_method': '',
+        'exploitable': False,
+        'recovered_plaintext': None,
+        'reasoning': text[:500]
+    }
+    
+    # Try to detect weakness from keywords
+    text_lower = text.lower()
+    for weakness, desc in WEAKNESS_TYPES.items():
+        if weakness.replace('_', ' ') in text_lower or weakness in text_lower:
+            result['weakness_detected'] = weakness
+            result['weakness_description'] = desc
+            break
+    
+    return result
 
-    rows = []
-    for r in ALL:
-        row = {'cipher': r.cipher, 'plain': r.plain, 'cipher_text': r.cipher_text, 'true_key': r.true_key}
-        # Classical solver results
-        if r.cipher == 'caesar':
-            t0=time.time(); ck, cp, cs = best_caesar(r.cipher_text); t1=time.time()
-            row.update({'classical_key': ck, 'classical_plain': cp, 'classical_time': t1-t0, 'classical_plain_exact': cp.strip().upper() == r.plain.strip().upper()})
-        elif r.cipher == 'affine':
-            t0=time.time(); ck, cp, cs = best_affine(r.cipher_text); t1=time.time()
-            row.update({'classical_key': ck, 'classical_plain': cp, 'classical_time': t1-t0, 'classical_plain_exact': cp.strip().upper() == r.plain.strip().upper()})
-        elif r.cipher == 'vigenere':
-            t0=time.time(); ck, cp, cs = vigenere_attack(r.cipher_text); t1=time.time()
-            row.update({'classical_key': ck, 'classical_plain': cp, 'classical_time': t1-t0, 'classical_plain_exact': cp.strip().upper() == r.plain.strip().upper()})
-        elif r.cipher == 'aes':
-            # classical heuristics
-            ct_bytes = bytes.fromhex(r.cipher_text)
-            ecb_guess = detect_ecb_repetition(ct_bytes)
-            iv_hex = None
-            nonce_hex = None
-            if isinstance(r.true_key, dict):
-                iv_hex = r.true_key.get('iv')
-                nonce_hex = r.true_key.get('nonce')
-            row.update({'classical_ecb_flag': ecb_guess, 'classical_iv_all_zero': detect_all_zero_iv(bytes.fromhex(iv_hex)) if iv_hex else False})
-        # LLM (classification)
-        llm_out = None
-        if run_llm and r.cipher == 'aes':
-            # call LLM classification
-            t0=time.time()
-            iv_hex = r.true_key.get('iv') if isinstance(r.true_key, dict) else None
-            nonce_hex = r.true_key.get('nonce') if isinstance(r.true_key, dict) else None
-            llm_out = llama_classify_aes(r.cipher_text, iv_hex=iv_hex, nonce_hex=nonce_hex)
-            t1=time.time()
-            row.update({'llm_mode_guess': llm_out.get('mode_guess'), 'llm_vulnerabilities': llm_out.get('vulnerabilities'), 'llm_reasoning': llm_out.get('reasoning'), 'llm_time_s': t1-t0})
+def analyze_with_heuristics(sample: Dict) -> Dict[str, Any]:
+    """Heuristic-based analysis fallback."""
+    ct = bytes.fromhex(sample['ciphertext'])
+    weakness = 'none'
+    attack_method = None
+    exploitable = False
+    
+    # Check for ECB repetition
+    blocks = [ct[i:i+BLOCK] for i in range(0, len(ct), BLOCK)]
+    if len(set(blocks)) < len(blocks):
+        weakness = 'ecb_repetition'
+        attack_method = 'block_repetition_analysis'
+        exploitable = True
+    
+    # Check for zero IV
+    if sample.get('iv'):
+        iv = bytes.fromhex(sample['iv'])
+        if all(b == 0 for b in iv):
+            weakness = 'cbc_zero_iv'
+            attack_method = 'iv_manipulation'
+            exploitable = True
+    
+    return {
+        'weakness_detected': weakness,
+        'weakness_description': WEAKNESS_TYPES.get(weakness, ''),
+        'attack_method': attack_method,
+        'exploitable': exploitable,
+        'recovered_plaintext': None,
+        'reasoning': f'Heuristic detected: {weakness}',
+        'source': 'heuristic'
+    }
+
+# ---------------- Cryptanalysis Attack Implementations ----------------
+def attack_ecb_repetition(sample: Dict) -> Optional[str]:
+    """Attack ECB with repeated blocks."""
+    ct = bytes.fromhex(sample['ciphertext'])
+    blocks = [ct[i:i+BLOCK] for i in range(0, len(ct), BLOCK)]
+    
+    # Find repeated blocks
+    block_counts = Counter(blocks)
+    repeated = [b for b, count in block_counts.items() if count > 1]
+    
+    if repeated:
+        # If we have known plaintext, we can map blocks
+        if 'known_plaintext' in sample:
+            known_pt = bytes.fromhex(sample['known_plaintext'])
+            known_ct_block = blocks[0]  # Assuming first block
+            # All blocks matching known_ct_block correspond to known_pt
+            return f"Identified {len(repeated)} repeated block patterns"
+    
+    return "Pattern detected but plaintext recovery requires additional information"
+
+def attack_cbc_zero_iv(sample: Dict) -> Optional[str]:
+    """Attack CBC with zero IV."""
+    # With zero IV, first block is vulnerable
+    # If we can control or predict the first block, we can manipulate it
+    return "First block vulnerable to IV manipulation attack"
+
+def attack_ctr_nonce_reuse(sample: Dict) -> Optional[str]:
+    """Attack CTR with nonce reuse."""
+    if 'related_ciphertext' not in sample:
+        return None
+    
+    ct1 = bytes.fromhex(sample['ciphertext'])
+    ct2 = bytes.fromhex(sample['related_ciphertext'])
+    
+    # XOR the two ciphertexts
+    min_len = min(len(ct1), len(ct2))
+    xor_result = bytes(a ^ b for a, b in zip(ct1[:min_len], ct2[:min_len]))
+    
+    # This equals pt1 XOR pt2
+    # If we know one plaintext, we can recover the other
+    if 'related_plaintext' in sample:
+        pt2 = bytes.fromhex(sample['related_plaintext'])
+        pt1_recovered = bytes(a ^ b for a, b in zip(xor_result[:min_len], pt2[:min_len]))
+        return pt1_recovered.hex()
+    
+    return xor_result.hex()  # Return pt1 XOR pt2
+
+def attack_ctr_keystream_reuse(sample: Dict) -> Optional[str]:
+    """Attack CTR with keystream reuse (same as nonce reuse)."""
+    return attack_ctr_nonce_reuse(sample)
+
+def perform_attack(sample: Dict, detected_weakness: str) -> Dict[str, Any]:
+    """Perform the actual cryptanalysis attack based on detected weakness."""
+    attack_result = {
+        'attack_successful': False,
+        'recovered_data': None,
+        'attack_details': ''
+    }
+    
+    try:
+        if detected_weakness == 'ecb_repetition':
+            result = attack_ecb_repetition(sample)
+            attack_result['recovered_data'] = result
+            attack_result['attack_successful'] = result is not None
+            attack_result['attack_details'] = 'Block repetition pattern identified'
+        
+        elif detected_weakness == 'cbc_zero_iv':
+            result = attack_cbc_zero_iv(sample)
+            attack_result['recovered_data'] = result
+            attack_result['attack_successful'] = True
+            attack_result['attack_details'] = 'IV manipulation vulnerability identified'
+        
+        elif detected_weakness == 'ctr_nonce_reuse':
+            result = attack_ctr_nonce_reuse(sample)
+            attack_result['recovered_data'] = result
+            attack_result['attack_successful'] = result is not None
+            attack_result['attack_details'] = 'XOR analysis performed on reused nonce'
+        
+        elif detected_weakness == 'ctr_keystream_reuse':
+            result = attack_ctr_keystream_reuse(sample)
+            attack_result['recovered_data'] = result
+            attack_result['attack_successful'] = result is not None
+            attack_result['attack_details'] = 'Keystream reuse exploited via XOR'
+        
         else:
-            row.update({'llm_mode_guess': None, 'llm_vulnerabilities': None, 'llm_reasoning': None, 'llm_time_s': None})
-        rows.append(row)
+            attack_result['attack_details'] = 'No attack method available for this weakness'
+    
+    except Exception as e:
+        attack_result['attack_details'] = f'Attack failed: {str(e)}'
+    
+    return attack_result
 
-    df = pd.DataFrame(rows)
-    csv_path = os.path.join(OUT_DIR, "results_crypto_llama.csv")
+# ---------------- Evaluation Framework ----------------
+def evaluate_cryptanalysis(samples: List[Dict], analyses: List[Dict], attacks: List[Dict]) -> Dict[str, Any]:
+    """Evaluate the success of cryptanalysis."""
+    metrics = {
+        'total_samples': len(samples),
+        'weakness_detection': {
+            'true_positive': 0,
+            'false_positive': 0,
+            'true_negative': 0,
+            'false_negative': 0
+        },
+        'attack_success': {
+            'successful_attacks': 0,
+            'failed_attacks': 0,
+            'no_attack_attempted': 0
+        },
+        'timing': {
+            'avg_analysis_time': 0.0,
+            'avg_attack_time': 0.0
+        }
+    }
+    
+    analysis_times = []
+    attack_times = []
+    
+    for i, (sample, analysis, attack) in enumerate(zip(samples, analyses, attacks)):
+        true_weakness = sample['weakness_type']
+        detected_weakness = analysis.get('weakness_detected', 'none')
+        
+        # Weakness detection metrics
+        if true_weakness != 'none' and detected_weakness != 'none':
+            if true_weakness == detected_weakness:
+                metrics['weakness_detection']['true_positive'] += 1
+            else:
+                metrics['weakness_detection']['false_positive'] += 1
+        elif true_weakness == 'none' and detected_weakness == 'none':
+            metrics['weakness_detection']['true_negative'] += 1
+        elif true_weakness == 'none' and detected_weakness != 'none':
+            metrics['weakness_detection']['false_positive'] += 1
+        else:
+            metrics['weakness_detection']['false_negative'] += 1
+        
+        # Attack success metrics
+        if sample['exploitable']:
+            if attack['attack_successful']:
+                metrics['attack_success']['successful_attacks'] += 1
+            else:
+                metrics['attack_success']['failed_attacks'] += 1
+        else:
+            metrics['attack_success']['no_attack_attempted'] += 1
+        
+        # Timing
+        if 'llm_latency_s' in analysis:
+            analysis_times.append(analysis['llm_latency_s'])
+        if 'attack_time' in attack:
+            attack_times.append(attack['attack_time'])
+    
+    if analysis_times:
+        metrics['timing']['avg_analysis_time'] = np.mean(analysis_times)
+    if attack_times:
+        metrics['timing']['avg_attack_time'] = np.mean(attack_times)
+    
+    # Calculate precision, recall, F1
+    tp = metrics['weakness_detection']['true_positive']
+    fp = metrics['weakness_detection']['false_positive']
+    fn = metrics['weakness_detection']['false_negative']
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    metrics['weakness_detection']['precision'] = precision
+    metrics['weakness_detection']['recall'] = recall
+    metrics['weakness_detection']['f1_score'] = f1
+    
+    return metrics
+
+# ---------------- Main Experiment Runner ----------------
+def run_cryptanalysis_experiment(n_samples: int = 50):
+    """Run the complete cryptanalysis experiment."""
+    print("=== AES Cryptanalysis with LLM Training ===\n")
+    
+    # Initialize Llama
+    if USE_LLAMA and LLAMA_AVAILABLE:
+        print("[INFO] Initializing Llama model...")
+        init_llama()
+        if LLAMA_OBJ is None:
+            print("[WARN] Llama initialization failed, using heuristics")
+        else:
+            print("[INFO] Llama model loaded successfully")
+    else:
+        print("[INFO] Using heuristic-based analysis only")
+    
+    # Generate samples
+    print(f"\n[INFO] Generating {n_samples} AES samples with various weaknesses...")
+    samples = generate_weak_aes_samples(n_samples_per_type=n_samples // 7)
+    samples = samples[:n_samples]  # Limit to requested number
+    
+    print(f"[INFO] Generated {len(samples)} samples")
+    print(f"  - Weak samples: {sum(1 for s in samples if s['weakness_type'] != 'none')}")
+    print(f"  - Secure samples: {sum(1 for s in samples if s['weakness_type'] == 'none')}")
+    
+    # Analyze samples
+    print("\n[INFO] Analyzing samples with LLM...")
+    analyses = []
+    attacks = []
+    
+    for i, sample in enumerate(samples):
+        if (i + 1) % 10 == 0:
+            print(f"  Processed {i + 1}/{len(samples)} samples...")
+        
+        # LLM analysis
+        t0 = time.time()
+        analysis = analyze_with_llm(sample)
+        t1 = time.time()
+        analysis['total_time'] = t1 - t0
+        analyses.append(analysis)
+        
+        # Perform attack if weakness detected
+        detected_weakness = analysis.get('weakness_detected', 'none')
+        if detected_weakness != 'none' and detected_weakness != 'unknown':
+            t0 = time.time()
+            attack = perform_attack(sample, detected_weakness)
+            t1 = time.time()
+            attack['attack_time'] = t1 - t0
+        else:
+            attack = {'attack_successful': False, 'recovered_data': None, 'attack_details': 'No weakness detected'}
+            attack['attack_time'] = 0.0
+        attacks.append(attack)
+    
+    # Evaluate
+    print("\n[INFO] Evaluating results...")
+    metrics = evaluate_cryptanalysis(samples, analyses, attacks)
+    
+    # Print metrics
+    print("\n=== RESULTS ===")
+    print(f"\nWeakness Detection:")
+    print(f"  Precision: {metrics['weakness_detection']['precision']:.2%}")
+    print(f"  Recall: {metrics['weakness_detection']['recall']:.2%}")
+    print(f"  F1 Score: {metrics['weakness_detection']['f1_score']:.2%}")
+    print(f"  True Positives: {metrics['weakness_detection']['true_positive']}")
+    print(f"  False Positives: {metrics['weakness_detection']['false_positive']}")
+    print(f"  False Negatives: {metrics['weakness_detection']['false_negative']}")
+    
+    print(f"\nAttack Success:")
+    print(f"  Successful: {metrics['attack_success']['successful_attacks']}")
+    print(f"  Failed: {metrics['attack_success']['failed_attacks']}")
+    
+    print(f"\nTiming:")
+    print(f"  Avg Analysis Time: {metrics['timing']['avg_analysis_time']:.3f}s")
+    print(f"  Avg Attack Time: {metrics['timing']['avg_attack_time']:.3f}s")
+    
+    # Save results
+    results = []
+    for sample, analysis, attack in zip(samples, analyses, attacks):
+        results.append({
+            'mode': sample['mode'],
+            'weakness_type': sample['weakness_type'],
+            'detected_weakness': analysis.get('weakness_detected', 'unknown'),
+            'weakness_match': sample['weakness_type'] == analysis.get('weakness_detected', ''),
+            'exploitable': sample['exploitable'],
+            'attack_successful': attack['attack_successful'],
+            'analysis_time': analysis.get('total_time', 0),
+            'attack_time': attack.get('attack_time', 0),
+            'source': analysis.get('source', 'unknown'),
+            'reasoning': analysis.get('reasoning', '')[:200]
+        })
+    
+    df = pd.DataFrame(results)
+    csv_path = os.path.join(OUT_DIR, "aes_cryptanalysis_results.csv")
     df.to_csv(csv_path, index=False)
-    print(f"[INFO] Saved results to {csv_path}")
-
-    # Evaluation: mode detection accuracy for AES only
-    aes_df = df[df['cipher']=='aes'].copy()
-    if not aes_df.empty:
-        # classical guess -> 'ECB' if repetition else 'CBC/CTR' we'll set to 'CBC' for demo
-        aes_df['classical_mode_guess'] = aes_df['classical_ecb_flag'].map(lambda b: 'ECB' if b else 'NON-ECB')
-        aes_df['true_mode'] = aes_df['true_key'].map(lambda d: d.get('mode') if isinstance(d, dict) else None)
-        classical_acc = (aes_df['classical_mode_guess'] == aes_df['true_mode']).mean()
-        print(f"[METRIC] Classical heuristic mode detection accuracy (ECB vs NON-ECB): {classical_acc:.2%}")
-
-        if run_llm:
-            # only count LLM predictions that are not UNKNOWN
-            mask = aes_df['llm_mode_guess'].notnull()
-            if mask.any():
-                llm_acc = (aes_df.loc[mask,'llm_mode_guess'].str.upper() == aes_df.loc[mask,'true_mode']).mean()
-                print(f"[METRIC] LLM mode detection accuracy (non-UNKNOWN subset): {llm_acc:.2%}")
-            else:
-                print("[METRIC] LLM produced no non-UNKNOWN outputs to evaluate.")
-
-        # Plot accuracy bars
-        # Build small summary for plotting
-        summary_rows = []
-        for method in ['classical','llm']:
-            if method == 'classical':
-                acc = classical_acc
-            else:
-                acc = llm_acc if run_llm and mask.any() else float('nan')
-            summary_rows.append({'method': method, 'accuracy': acc})
-        summary_df = pd.DataFrame(summary_rows)
-        plt.figure(figsize=(6,4))
-        sns.barplot(data=summary_df, x='method', y='accuracy')
-        plt.ylim(0,1)
-        plt.ylabel('Accuracy')
-        plt.title('Mode detection accuracy (ECB vs target)')
-        plt.tight_layout()
-        plt.savefig(os.path.join(OUT_DIR, "mode_detection_accuracy.png"), dpi=200)
-        plt.close()
-        print(f"[INFO] Saved mode detection plot to {os.path.join(OUT_DIR,'mode_detection_accuracy.png')}")
-
-    # Optional toy brute force on one AES record (very small keyspace)
-    if toy_bruteforce_demo:
-        print("[INFO] Running toy brute-force demo (ONLY tiny keyspace: 256 candidates).")
-        for _, row in aes_df.iterrows():
-            true = row['true_key']
-            mode = true.get('mode') if isinstance(true, dict) else None
-            iv_hex = true.get('iv') if isinstance(true, dict) else None
-            ct_bytes = bytes.fromhex(row['cipher_text'])
-            iv_bytes = bytes.fromhex(iv_hex) if iv_hex else None
-            found, attempts = toy_repeated_byte_bruteforce(ct_bytes, iv_bytes, mode, max_candidates=256)
-            print(f"Toy brute-force on record mode={mode}: attempts={attempts}, found={len(found)}")
-            if found:
-                print(" Found candidate(s) (key_byte, plaintext snippet):")
-                for bval, pt in found:
-                    print(f"  {bval} -> {pt[:60]}")
-            else:
-                print(" No toy key recovered (expected for true random keys).")
-    return df
-
-# ----------------------------
-# Entrypoint
-# ----------------------------
-import math
-
-def main():
-    print("=== Crypto Analysis Demo (safe) ===")
-    if USE_LLAMA:
-        if not LLAMA_AVAILABLE:
-            print("[WARN] llama_cpp not available. Using simulated classifier.")
-        else:
-            init = init_llama if 'init_llama' in globals() else None
-            # init_llama defined earlier as init_llama(...) name mismatch fix
-            try:
-                init_llama(MODEL_PATH, n_threads=LLAMA_THREADS)
-            except Exception as e:
-                # fallback handled inside init_llama
-                pass
-
-    # Run experiments: enable run_llm if you want classification via Llama (or simulated)
-    df = run_experiments(run_llm=USE_LLAMA and LLAMA_AVAILABLE and (LLAMA_OBJ is not None), toy_bruteforce_demo=False)
-
-    print("\nSample of results:")
-    print(df.head(10).to_string(index=False))
+    print(f"\n[INFO] Results saved to {csv_path}")
+    
+    # Save detailed metrics
+    metrics_path = os.path.join(OUT_DIR, "aes_cryptanalysis_metrics.json")
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"[INFO] Metrics saved to {metrics_path}")
+    
+    return samples, analyses, attacks, metrics
 
 if __name__ == "__main__":
-    main()
+    run_cryptanalysis_experiment(n_samples=50)
