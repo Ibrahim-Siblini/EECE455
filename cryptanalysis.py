@@ -212,41 +212,88 @@ def generate_weak_aes_samples(n_samples_per_type: int = 10) -> List[Dict]:
     random.shuffle(samples)
     return samples
 
-# ---------------- Few-Shot Training Examples ----------------
+# ---------------- Improved Few-Shot Training Examples ----------------
 FEW_SHOT_EXAMPLES = """
 # Example 1: ECB Repetition Attack
 Ciphertext: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6
+IV: NONE
+Nonce: NONE
+Mode: ECB
 Analysis: The ciphertext shows repeating 16-byte blocks (a1b2c3d4e5f6 repeated 4 times).
-Weakness: ECB mode with repeated plaintext blocks
+Weakness: ecb_repetition
 Attack: Since ECB encrypts identical blocks identically, we can identify patterns.
 Plaintext blocks are likely identical. If we know one plaintext block, we can identify all occurrences.
 Result: Pattern detected, plaintext structure revealed.
 
+JSON Response:
+{
+    "weakness_detected": "ecb_repetition",
+    "weakness_description": "ECB mode with repeated plaintext blocks",
+    "attack_method": "block_repetition_analysis",
+    "exploitable": true,
+    "recovered_plaintext": null,
+    "reasoning": "Repeating 16-byte blocks detected in ciphertext"
+}
+
 # Example 2: CBC Zero IV Attack
 Ciphertext: 5f8a3b2c1d4e6f7a8b9c0d1e2f3a4b5
 IV: 00000000000000000000000000000000
+Nonce: NONE
+Mode: CBC
 Analysis: IV is all zeros, which is a security weakness.
-Weakness: CBC mode with all-zero IV
-Attack: With zero IV, the first block's encryption is predictable. If we can manipulate the IV, we can control the first block's decryption.
+Weakness: cbc_zero_iv
+Attack: With zero IV, the first block's encryption is predictable.
 Result: First block vulnerable to manipulation.
 
+JSON Response:
+{
+    "weakness_detected": "cbc_zero_iv",
+    "weakness_description": "CBC mode with all-zero IV",
+    "attack_method": "iv_manipulation",
+    "exploitable": true,
+    "recovered_plaintext": null,
+    "reasoning": "IV is all zeros"
+}
+
 # Example 3: CTR Nonce Reuse Attack
-Ciphertext1: a1b2c3d4e5f6...
-Ciphertext2: f6e5d4c3b2a1...
-Nonce: 1234567890abcdef (same for both)
+Ciphertext: a1b2c3d4e5f6...
+IV: NONE
+Nonce: 1234567890abcdef
+Mode: CTR
 Analysis: Same nonce used with different keys/plaintexts.
-Weakness: CTR nonce reuse
-Attack: XOR the two ciphertexts: ct1 XOR ct2 = (pt1 XOR keystream) XOR (pt2 XOR keystream) = pt1 XOR pt2
-If we know pt1, we can recover pt2, or use frequency analysis on pt1 XOR pt2.
+Weakness: ctr_nonce_reuse
+Attack: XOR the two ciphertexts: ct1 XOR ct2 = pt1 XOR pt2
 Result: Plaintexts can be recovered through XOR analysis.
+
+JSON Response:
+{
+    "weakness_detected": "ctr_nonce_reuse",
+    "weakness_description": "CTR mode with nonce reuse",
+    "attack_method": "nonce_reuse_xor_attack",
+    "exploitable": true,
+    "recovered_plaintext": null,
+    "reasoning": "Nonce reuse detected"
+}
 
 # Example 4: Secure CBC
 Ciphertext: 8f3a7b2c9d4e1f6a5b8c2d7e3f9a4b1c6
-IV: 7a3f8b2c9d4e1f6a5b8c2d7e3f9a4b1 (random)
-Analysis: Random IV, proper CBC mode implementation.
-Weakness: None detected
+IV: 7a3f8b2c9d4e1f6a5b8c2d7e3f9a4b1
+Nonce: NONE
+Mode: CBC
+Analysis: Random IV, proper CBC mode implementation. No repeating blocks, IV is random.
+Weakness: none
 Attack: No obvious attack vector
 Result: Secure implementation.
+
+JSON Response:
+{
+    "weakness_detected": "none",
+    "weakness_description": "No known weakness",
+    "attack_method": null,
+    "exploitable": false,
+    "recovered_plaintext": null,
+    "reasoning": "Random IV, no repeating blocks, secure implementation"
+}
 """
 
 # ---------------- Enhanced LLM Cryptanalysis Function ----------------
@@ -266,9 +313,13 @@ def init_llama(model_path=MODEL_PATH, n_threads=LLAMA_THREADS):
 def analyze_with_llm(sample: Dict) -> Dict[str, Any]:
     """
     Use LLM with few-shot learning to analyze AES sample and detect weaknesses.
+    Now includes validation against heuristics.
     """
     if not USE_LLAMA or not LLAMA_AVAILABLE or LLAMA_OBJ is None:
         return analyze_with_heuristics(sample)
+    
+    # First run heuristics to get baseline
+    heuristic_result = analyze_with_heuristics(sample)
     
     prompt = f"""{FEW_SHOT_EXAMPLES}
 
@@ -278,20 +329,20 @@ IV: {sample.get('iv', 'NONE')}
 Nonce: {sample.get('nonce', 'NONE')}
 Mode: {sample.get('mode', 'UNKNOWN')}
 
-Analyze this AES ciphertext and identify:
-1. What weakness exists (if any)?
-2. How can this weakness be exploited?
-3. What attack method would work?
-4. Can plaintext be recovered (partially or fully)?
+IMPORTANT: You must return ONLY valid JSON. Check the ciphertext carefully:
+- For ECB: Look for repeating 16-byte blocks in the hex string
+- For CBC: Check if IV is all zeros (00000000000000000000000000000000)
+- For CTR: Check if nonce is provided and if there's a related ciphertext
+- If no weakness is clearly visible, return "none"
 
-Provide your analysis in JSON format:
+Return your analysis as JSON:
 {{
-    "weakness_detected": "weakness_type or 'none'",
-    "weakness_description": "detailed description",
-    "attack_method": "how to exploit",
-    "exploitable": true/false,
-    "recovered_plaintext": "hex string if recoverable, else null",
-    "reasoning": "step-by-step analysis"
+    "weakness_detected": "exact_weakness_type_or_none",
+    "weakness_description": "description",
+    "attack_method": "method or null",
+    "exploitable": true_or_false,
+    "recovered_plaintext": null,
+    "reasoning": "your analysis"
 }}
 """
     
@@ -299,10 +350,10 @@ Provide your analysis in JSON format:
         t0 = time.time()
         resp = LLAMA_OBJ.create_completion(
             prompt=prompt,
-            max_tokens=512,
-            temperature=0.1,  # Low temperature for more deterministic analysis
-            top_p=0.95,
-            stop=["# New Sample", "\n\n#"]
+            max_tokens=400,
+            temperature=0.0,  # Even lower for more deterministic
+            top_p=0.9,
+            stop=["# New Sample", "\n\n#", "```"]
         )
         t1 = time.time()
         
@@ -313,33 +364,129 @@ Provide your analysis in JSON format:
         result['llm_latency_s'] = t1 - t0
         result['source'] = 'llm'
         
+        # VALIDATION: Cross-check with heuristics
+        result = validate_llm_result(result, heuristic_result, sample)
+        
         return result
     except Exception as e:
         print(f"[WARN] LLM analysis failed: {e}")
-        return analyze_with_heuristics(sample)
+        return heuristic_result
+
+def validate_llm_result(llm_result: Dict, heuristic_result: Dict, sample: Dict) -> Dict[str, Any]:
+    """
+    Validate LLM result against heuristics and actual ciphertext patterns.
+    This reduces false positives by requiring evidence.
+    """
+    detected = llm_result.get('weakness_detected', 'unknown')
+    
+    # If LLM says "unknown", use heuristics
+    if detected == 'unknown':
+        return heuristic_result
+    
+    # Validate detected weakness against actual patterns
+    ct = bytes.fromhex(sample['ciphertext'])
+    
+    # Check ECB repetition
+    if detected == 'ecb_repetition':
+        blocks = [ct[i:i+BLOCK] for i in range(0, len(ct), BLOCK)]
+        if len(set(blocks)) >= len(blocks):
+            # No repetition found, LLM was wrong
+            return heuristic_result  # Use heuristic instead
+    
+    # Check CBC zero IV
+    elif detected == 'cbc_zero_iv':
+        if not sample.get('iv'):
+            return heuristic_result  # No IV provided, can't be zero IV
+        iv = bytes.fromhex(sample['iv'])
+        if not all(b == 0 for b in iv):
+            return heuristic_result  # IV is not zero
+    
+    # Check CBC predictable IV
+    elif detected == 'cbc_predictable_iv':
+        if not sample.get('iv'):
+            return heuristic_result
+        # This is harder to validate, but we can check if it's sequential
+        # For now, trust heuristic if it says none
+        if heuristic_result.get('weakness_detected') == 'none':
+            return heuristic_result
+    
+    # Check CTR nonce reuse
+    elif detected in ['ctr_nonce_reuse', 'ctr_keystream_reuse']:
+        if not sample.get('nonce'):
+            return heuristic_result
+        if 'related_ciphertext' not in sample:
+            # Can't verify nonce reuse without related ciphertext
+            if heuristic_result.get('weakness_detected') == 'none':
+                return heuristic_result
+    
+    # Check ECB known plaintext
+    elif detected == 'ecb_known_plaintext':
+        if 'known_plaintext' not in sample:
+            # Can't verify without known plaintext info
+            if heuristic_result.get('weakness_detected') == 'none':
+                return heuristic_result
+    
+    # If we get here, the detection seems valid
+    return llm_result
 
 def parse_llm_response(text: str, sample: Dict) -> Dict[str, Any]:
-    """Parse LLM response and extract structured information."""
-    # Try to find JSON in response
+    """Parse LLM response and extract structured information with better extraction."""
+    # Try to find JSON in response - multiple strategies
+    json_candidates = []
+    
+    # Strategy 1: Look for JSON block
     try:
-        # Look for JSON block
         start = text.find('{')
         end = text.rfind('}') + 1
         if start >= 0 and end > start:
             json_str = text[start:end]
             parsed = json.loads(json_str)
-            return {
-                'weakness_detected': parsed.get('weakness_detected', 'unknown'),
-                'weakness_description': parsed.get('weakness_description', ''),
-                'attack_method': parsed.get('attack_method', ''),
-                'exploitable': parsed.get('exploitable', False),
-                'recovered_plaintext': parsed.get('recovered_plaintext'),
-                'reasoning': parsed.get('reasoning', text[:200])
-            }
+            json_candidates.append(parsed)
     except:
         pass
     
-    # Fallback: extract information from text
+    # Strategy 2: Look for JSON in code blocks
+    try:
+        if '```json' in text:
+            start = text.find('```json') + 7
+            end = text.find('```', start)
+            if end > start:
+                json_str = text[start:end].strip()
+                parsed = json.loads(json_str)
+                json_candidates.append(parsed)
+    except:
+        pass
+    
+    # Strategy 3: Look for JSON after "JSON Response:" or similar
+    try:
+        markers = ['JSON Response:', 'Response:', 'Answer:', 'Result:']
+        for marker in markers:
+            if marker in text:
+                idx = text.find(marker) + len(marker)
+                json_part = text[idx:].strip()
+                start = json_part.find('{')
+                end = json_part.rfind('}') + 1
+                if start >= 0 and end > start:
+                    json_str = json_part[start:end]
+                    parsed = json.loads(json_str)
+                    json_candidates.append(parsed)
+                    break
+    except:
+        pass
+    
+    # Use first valid JSON candidate
+    if json_candidates:
+        parsed = json_candidates[0]
+        return {
+            'weakness_detected': parsed.get('weakness_detected', 'unknown'),
+            'weakness_description': parsed.get('weakness_description', ''),
+            'attack_method': parsed.get('attack_method', ''),
+            'exploitable': parsed.get('exploitable', False),
+            'recovered_plaintext': parsed.get('recovered_plaintext'),
+            'reasoning': parsed.get('reasoning', text[:200])
+        }
+    
+    # Fallback: extract from text with better keyword matching
     result = {
         'weakness_detected': 'unknown',
         'weakness_description': '',
@@ -349,24 +496,40 @@ def parse_llm_response(text: str, sample: Dict) -> Dict[str, Any]:
         'reasoning': text[:500]
     }
     
-    # Try to detect weakness from keywords
+    # Better keyword detection with context
     text_lower = text.lower()
-    for weakness, desc in WEAKNESS_TYPES.items():
-        if weakness.replace('_', ' ') in text_lower or weakness in text_lower:
+    
+    # Check for explicit "none" or "no weakness"
+    if any(phrase in text_lower for phrase in ['no weakness', 'weakness: none', '"none"', 'secure', 'no known weakness']):
+        result['weakness_detected'] = 'none'
+        return result
+    
+    # Check for specific weaknesses with better patterns
+    weakness_patterns = {
+        'ecb_repetition': ['ecb repetition', 'repeating blocks', 'repeated blocks', 'ecb_repetition'],
+        'cbc_zero_iv': ['zero iv', 'all zero iv', 'cbc_zero_iv', 'iv is all zeros'],
+        'cbc_predictable_iv': ['predictable iv', 'sequential iv', 'cbc_predictable_iv'],
+        'ctr_nonce_reuse': ['nonce reuse', 'ctr_nonce_reuse', 'reused nonce'],
+        'ctr_keystream_reuse': ['keystream reuse', 'ctr_keystream_reuse'],
+        'ecb_known_plaintext': ['known plaintext', 'ecb_known_plaintext']
+    }
+    
+    for weakness, patterns in weakness_patterns.items():
+        if any(pattern in text_lower for pattern in patterns):
             result['weakness_detected'] = weakness
-            result['weakness_description'] = desc
+            result['weakness_description'] = WEAKNESS_TYPES.get(weakness, '')
             break
     
     return result
 
 def analyze_with_heuristics(sample: Dict) -> Dict[str, Any]:
-    """Heuristic-based analysis fallback."""
+    """Enhanced heuristic-based analysis with more checks."""
     ct = bytes.fromhex(sample['ciphertext'])
     weakness = 'none'
     attack_method = None
     exploitable = False
     
-    # Check for ECB repetition
+    # Check for ECB repetition (more thorough)
     blocks = [ct[i:i+BLOCK] for i in range(0, len(ct), BLOCK)]
     if len(set(blocks)) < len(blocks):
         weakness = 'ecb_repetition'
@@ -380,6 +543,34 @@ def analyze_with_heuristics(sample: Dict) -> Dict[str, Any]:
             weakness = 'cbc_zero_iv'
             attack_method = 'iv_manipulation'
             exploitable = True
+    
+    # Check for predictable IV (sequential pattern)
+    if sample.get('iv') and weakness == 'none':
+        iv = bytes.fromhex(sample['iv'])
+        # Check if IV is mostly zeros with a small number at the end (sequential pattern)
+        if iv[:15] == bytes(15) and iv[15] < 100:
+            weakness = 'cbc_predictable_iv'
+            attack_method = 'predictable_iv_attack'
+            exploitable = True
+    
+    # Check for CTR nonce reuse (if we have related ciphertext)
+    if sample.get('nonce') and 'related_ciphertext' in sample and weakness == 'none':
+        weakness = 'ctr_nonce_reuse'
+        attack_method = 'nonce_reuse_xor_attack'
+        exploitable = True
+    
+    # Check for CTR keystream reuse (same key, same nonce)
+    if sample.get('nonce') and 'related_ciphertext' in sample and sample.get('mode') == 'CTR' and weakness == 'none':
+        # If same nonce is used, it's keystream reuse
+        weakness = 'ctr_keystream_reuse'
+        attack_method = 'keystream_reuse_xor'
+        exploitable = True
+    
+    # Check for ECB known plaintext
+    if sample.get('mode') == 'ECB' and 'known_plaintext' in sample and weakness == 'none':
+        weakness = 'ecb_known_plaintext'
+        attack_method = 'known_plaintext_attack'
+        exploitable = True
     
     return {
         'weakness_detected': weakness,
